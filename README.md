@@ -216,7 +216,7 @@ AttributeError: 'MVTecDataset' object has no attribute 'transform_std'
 两个方法的 15 类模型（`patchcore_params.pkl` + `nnscorer_search_index.faiss`）与分割可视化样例，已发布于本仓库的 **Releases** 页面：
 
 ```
-https://github.com/<USER>/patchcore-mvtec-repro/releases/tag/v1.0
+https://github.com/xieanqi1/patchcore-mvtec-repro/releases/tag/v1.0
 ```
 
 包含两个压缩包：
