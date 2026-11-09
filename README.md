@@ -1,298 +1,232 @@
-Visual Studio Code 1.145
+# PatchCore on MVTec AD：复现与图像级评分聚合改进
 
-更新后显示发行说明
+本仓库为课程期末大作业的代码与实验结果。工作内容为：
 
-Follow us on LinkedIn, X, Bluesky, Instagram | View online
+1. 完整复现 PatchCore（CVPR 2022）在 MVTec AD 15 个类别上的单类别实验；
+2. 修复官方实现中分割可视化代码引用不存在属性的问题；
+3. 提出一种图像级评分聚合改进：把全局最大值聚合替换为得分最高前 1% patch 的均值；
+4. 给出 15 类对比实验、聚合比例敏感性分析与「缺陷稀疏度—指标失衡」的相关性分析。
 
-Release date: November 4, 2026
+---
 
-Update 1.145.1: The update addresses these issues.
+## 1. 目录结构
 
-Update 1.145.2: The update addresses these issues.
+```text
+.
+├── bin/                      # 运行入口（含 transform_std 修复）
+├── src/patchcore/            # 核心实现（含 top-k 聚合补丁）
+├── patches/                  # 相对上游的完整 diff
+│   ├── 01-fix-transform-std.patch
+│   └── 02-topk-aggregation.patch
+├── scripts/
+│   ├── run_baseline.sh       # 15 类基线
+│   ├── run_c2.sh             # 15 类改进方法
+│   ├── run_ablation.sh       # 聚合比例消融
+│   └── analyze_gap.py        # 缺陷面积与指标差距的相关性分析
+├── reports/                  # 各次运行的 results.csv
+├── requirements.txt          # 上游依赖清单
+├── requirements-lock.txt     # 本次实验的实际 pip freeze
+└── README.md
+```
 
-Release highlights
-This week, your remote agent sessions feel a bit more local. Preview apps and use canvases right in VS Code, fine-tune automation schedules with cron, and turn down the noise in chat. And when you need a break, Blobby is ready to play.
+## 2. 环境
 
-Remote agents: Preview apps and use interactive canvases from remote agent sessions without leaving the Agents window.
+- Python 3.8
+- PyTorch 1.12.1+cu116，torchvision 0.13.1+cu116
+- faiss-cpu 1.8.0
+- GPU：单卡 NVIDIA RTX 3090（24 GB）即可，显存占用约 2.5 GB
 
-Automations: Run recurring agent tasks on custom schedules beyond the built-in presets with cron.
+### 2.1 从零创建环境
 
-Agent verbosity: Keep chats concise or see the full details of the agent's reasoning and tool calls, your choice.
+```bash
+conda create -y -p ./envs/patchcore python=3.8 pip
+conda activate ./envs/patchcore
 
-File exclusions: Exclude folders while keeping the files you need visible and searchable.
+pip install torch==1.12.1+cu116 torchvision==0.13.1+cu116 \
+    --extra-index-url https://download.pytorch.org/whl/cu116
 
-Fun: Take a short break with a platform-jumping game starring Blobby, the VS Code pet.
+pip install -r requirements.txt
+pip install -e .
+pip install timm
+```
 
-Already installed? Use Check for Updates in VS Code. For upcoming features, use the Insiders build.
+> 上游 requirements.txt 未列出 timm，但代码实际需要。
+> 若要严格对齐本次实验的包版本，可执行： pip install -r requirements-lock.txt
 
-Happy Coding!
+### 2.2 快速自检
 
-Remote agents
-Browse over remote agent host connections (Preview)
-Setting:   workbench.browser.enableRemoteProxy
+```bash
+python -c "import torch, faiss; print(torch.__version__, torch.cuda.is_available(), torch.cuda.device_count())"
+python bin/run_patchcore.py --help
+```
 
-When an agent session runs on a remote agent host, the integrated browser in the Agents window now loads pages through that host, as it already does in remote workspaces. When the agent starts a dev server on the remote machine, you can open it right in the Agents window to preview the app, validate the agent's changes, and give it feedback, as you would in a local session.
+第二条命令应打印出 dataset、patch_core、sampler 三个子命令。
 
-Screenshot showing the URL bar in the integrated browser, showing 'Connected via kyles-mbp'.
+## 3. 数据准备
 
-Enable   workbench.browser.enableRemoteProxy to try it out, and file any issues you encounter in the VS Code repository.
+从 MVTec AD 官方页面下载完整数据集（约 4.9 GB）：
 
-Remote canvases (Preview)
-Settings:   workbench.browser.enableRemoteProxy ,   chat.canvases.enabled
+https://www.mvtec.com/research-teaching/datasets/mvtec-ad
 
-Thanks to the remote agent host connections support, you can now also use canvases that are hosted on a remote agent host.
+解压后的目录结构必须为：
 
-Enable   chat.canvases.enabled and   workbench.browser.enableRemoteProxy to try it out, and file any issues you encounter in the VS Code repository.
+```text
+<数据根目录>/
+├── bottle/
+│   ├── train/good/*.png
+│   ├── test/<缺陷类型>/*.png
+│   └── ground_truth/<缺陷类型>/*_mask.png
+├── cable/
+└── ...（共 15 类）
+```
 
-Agents
-Mix and match agent harnesses in one session (Preview)
-Setting:   chat.agentHost.multipleChatProviders.enabled
+即「数据根目录 / 类别 / train、test、ground_truth」三层，缺一不可。缺少 ground_truth 时无法计算像素级指标。
 
-Nested sessions let you keep related conversations together within a single main chat session. Previously, every nested session inherited its parent session's harness. If you wanted a second opinion from another agent, you had to start a separate session and lose that grouping.
+## 4. 复现步骤
 
-In this release, nested sessions can use different harnesses than their parent session. For example, ask Claude to review the plan that a Copilot chat wrote, or give Codex the same task, side by side in the same session. When you create a new nested session, use the harness picker to switch to a different harness.
+先设置环境变量：
 
-Each chat has its own model, agent, and permission levels, based on its harness. Changing them in one chat doesn't affect the others. When you move a chat, it keeps its history and continues with its selected harness. When you fork a nested session, it continues with the same configuration.
+```bash
+conda activate ./envs/patchcore
+export DATA=/path/to/mvtec_ad
+export OUT=/path/to/results
+export CUDA_VISIBLE_DEVICES=0
+```
 
-A chat that uses a different harness than its session names its harness when you hover over its chat tab or its row in the sessions list.
+### 4.1 基线（官方聚合方式，全局最大）
 
+```bash
+bash scripts/run_baseline.sh
+```
 
-Enable   chat.agentHost.multipleChatProviders.enabled to get started. Let us know what you think by filing an issue.
+### 4.2 本文方法（top-1% 均值聚合）
 
-Cron schedules and custom agents for local automations
-Instead of manually running agent tasks one by one, you can use automations to schedule and run them automatically, either on demand or on a set schedule.
+```bash
+bash scripts/run_c2.sh
+```
 
-This release gives you more flexibility for local automations and keeps the Automations view focused on active work:
+### 4.3 消融（聚合比例 ρ 的敏感性）
 
-Use cron schedules: Select Cron to enter a five-field cron expression when the other schedule presets aren't precise enough. The dialog validates the expression and describes the resulting schedule. Cron schedules are not available for cloud automations.
+```bash
+bash scripts/run_ablation.sh
+```
 
-Use workspace custom agents: Choose a custom agent from the selected workspace when you create or edit a local automation.
+### 4.4 相关性分析（缺陷面积与指标差距）
 
-Focus on active automations: Disabled automations appear in a collapsed Disabled automations section, so they don't obscure run history and active automations.
+```bash
+python scripts/analyze_gap.py --data "$DATA"
+```
 
-Screenshot showing the Cron schedule editor for a local automation.
+该脚本只读取 ground_truth 掩码，不修改任何文件，输出每类的平均缺陷面积占比，用于复现论文图 3。
 
-Learn more about creating and managing agent automations.
+## 5. 预期结果
 
-Pin canvases to sidebar (Experimental)
-Setting:   chat.canvases.enabled
+单卡 3090 下每类约 3–6 分钟，15 类合计约 1 小时。
 
-To make it easier to access frequently used canvases, you can now pin a canvas to appear in the left sidebar. To pin a canvas, open it and select the Add to Sidebar button above the canvas. Pinned canvases remain accessible in the sidebar even when you navigate away from them.
+### 5.1 基线
 
+| 指标 | 本文复现 | 原论文 |
+|---|---:|---:|
+| 图像级 AUROC（15 类平均） | 99.05% | 99.6% |
+| 全像素级 AUROC | 98.12% | 98.1% |
+| 异常像素 AUROC | 97.36% | 98.4% |
 
-Copilot harness
-The Copilot harness continues to be the default for new sessions in VS Code. It's our latest harness, built on the Copilot SDK, a shared foundation that helps align behavior, capabilities, and improvements across Copilot products.
+### 5.2 本文方法
 
-When you start a new session, Copilot in the harness picker indicates that the session uses the Copilot harness. In VS Code, you can keep Copilot harness sessions running in the background and access them from both the VS Code editor window and the Agents window. These sessions run through the Agent Host.
+| 指标 | 基线 | 本文方法 |
+|---|---:|---:|
+| 图像级 AUROC（15 类平均） | 99.05% | 99.12% |
 
-To help you adopt the Copilot harness with your existing workflows, we've added a Local-to-Copilot harness transition guide. It covers customization compatibility, session continuity, and organization rollout and verification.
+逐类数值见 reports 目录下的 results.csv，每行格式为：
 
-Thank you for the feedback that continues to shape these improvements. Please continue filing issues about your experience, especially if a workflow or integration prevents your organization from moving off the Local harness.
+```text
+Mean, <instance_auroc>, <full_pixel_auroc>, <anomaly_pixel_auroc>
+```
 
-Learn how to work with the Copilot harness, or explore the architecture and workflows in the agent host blog post.
+> 论文中所有表格数值均直接来自 reports 中的 CSV，可逐条核对。
+> 由于 GPU 型号、驱动与 FAISS 版本差异，复现结果可能与上表存在 ±0.2 个百分点的波动，属正常范围。
 
-Working set improvements (Experimental)
-Setting:   chat.editor.workingSet.enabled
+## 6. 方法说明
 
-Last release, we introduced the working set for Copilot harness sessions, letting you review pending agent edits. You can keep or undo changes, as you could do with the Local harness.
+### 6.1 基线流程
 
-Screenshot of the working set in Copilot harness sessions.
+1. 图像缩放到 224×224，ImageNet 归一化；
+2. WideResNet50-2 提取 layer2 与 layer3 特征（512 + 1024 维）；
+3. 3×3 邻域平均池化得到 patch 嵌入；
+4. 贪心 coreset 采样保留 10%，构成记忆库；
+5. 测试时计算每个 patch 到记忆库的最近邻距离，得到像素级异常图；
+6. 图像级分数取所有 patch 分数的最大值。
 
-We are further improving the working set experience in Copilot harness sessions:
+### 6.2 本文改进
 
-Files in WSL, Dev Containers, and SSH workspaces open from the working set on the correct host.
-When several tool calls edit the same file in parallel, the working set tracks those edits and the editor's inline review controls remain available after editing finishes.
-The working set functionality remains enabled by default in the editor window. Learn more about reviewing agent edits with the working set, including which edits it tracks.
+只改动第 6 步：取分数最高的前 K 个 patch 的均值作为图像级分数。
 
-Improved guidance when required sandboxing is unavailable
-Agent sandboxing limits what terminal commands can access, like the file system and network resources. Your organization can require it with managed settings that disallow bypassing the sandbox.
+其中 K = max(1, ⌈ρ·P⌉)，P 为该图像的 patch 总数，ρ 取 0.01。
 
-If your organization requires sandboxing but your machine can't run it, the warning banner explains why terminal commands are blocked and how to resolve the problem. It shows the specific cause, such as a missing dependency, and links to troubleshooting steps.
+对应代码（src/patchcore/patchcore.py 的 score 方法）：
 
-If your account and organization support cloud sessions (Experimental), consider running agent tools in the cloud instead of on your machine.
+```python
+_r = float(os.environ.get("PATCHCORE_TOPK_RATIO", "0") or 0)
+if _r > 0 and x.ndim >= 1 and x.shape[-1] > 1:
+    _k = max(1, int(_r * x.shape[-1]))
+    x = torch.topk(x, _k, dim=-1).values.mean(dim=-1)
+```
 
-Chat
-Choose agent verbosity (Experimental)
-Setting:   chat.persistentProgressVerbosity
+通过环境变量 PATCHCORE_TOPK_RATIO 控制：
 
-Keep long chats readable, or follow the agent's reasoning and tool calls in detail when you need to understand its actions. Open the Chat view's More Actions menu and select View Mode:
+- 不设置或设为 0：严格等价于官方实现（基线结果由此产生）
+- 设为 0.01：本文方法
 
-Conversation: Focus on the conversation. Reasoning and tool calls are grouped into collapsed sections between blocks of response text. Expand a section to inspect its details.
-Verbose: Follow each step with tool calls expanded, without an internal scrolling limit on tool groups.
-Compact (default): Preview tool calls while they run, then collapse completed groups to expandable summary rows.
-You can switch modes without starting a new chat. The modes change how the conversation is displayed, not its context or the work the agent performs.
+因此基线与改进可用同一份代码复现，二者的唯一差异就是这一个环境变量。
 
+## 7. 相对上游的改动
 
-With persistent progress enabled, the active progress indicator stays above the chat input while you scroll back through a response. If you prefer an animated input border instead, enable   chat.progressBorder.enabled .
+完整的 diff 见 patches 目录，共两处。
 
-Chat performance improvements
-Reopen and browse long Copilot harness chats more smoothly. VS Code reuses existing reasoning titles and renders terminal output as you reveal it. Terminal output in restored tool calls is rendered when you expand or reveal it, rather than all at once.
+### 7.1 修复可视化代码的属性引用（bin/run_patchcore.py）
 
-This release also reduces repeated progress updates and layout measurements when restoring and navigating long conversations.
+官方实现的可视化代码引用了数据集中并不存在的属性 transform_std 与 transform_mean，而数据集类只定义了 IMAGENET_STD 与 IMAGENET_MEAN 常量，直接运行会抛出：
 
-Inline chat attachments (Experimental)
-Setting:   chat.inlineAttachments.enabled
+```text
+AttributeError: 'MVTecDataset' object has no attribute 'transform_std'
+```
 
-Keep file references and other context next to the instructions they belong to. Enable this setting to insert attachment pills at the cursor in your prompt, rather than in a separate row above the input.
+本补丁将其替换为实际的 ImageNet 均值与标准差数值。
 
-Move across, select, or delete an attachment pill as a single character. Previous messages keep the pills inline, so references stay with the surrounding instructions.
+### 7.2 加入 top-k 聚合（src/patchcore/patchcore.py）
 
-Inline attachments are on by default in Insiders and off by default in Stable.
+在 PatchMaker.score 方法中加入 top-k 均值聚合分支，由环境变量控制，默认行为不变。
 
-Screenshot showing file and image attachment pills inline with the surrounding text in the chat input.
+上游基准版本：amazon-science/patchcore-inspection@fcaa92f
 
-Attach files from anywhere on your computer
-Previously, to give chat a file outside your workspace, such as a screenshot or mockup on your desktop, you had to drag it in from your file manager or ask the agent to find it. Select Add Context (+) > Files to choose one or more files with the standard file dialog, even in a new chat without a workspace. In cloud sessions, the chooser lists only images.
+## 8. 权重
 
-Screenshot showing the Add Context menu in chat with the Files entry above Image from Clipboard and Screenshot Window.
+两个方法的 15 类记忆库（patchcore_params.pkl 与 nnscorer_search_index.faiss）已发布于本仓库的 Releases 页面：
 
-When sandboxing is enabled in Copilot harness sessions, the agent can read the files and folders you attach, even when they're outside the workspace. Each attached path is readable for the rest of the session, but the agent can't write to it, and the access isn't saved to your settings. With Manual permissions, the agent no longer asks before reading an attached file. If your organization's managed settings define their own list of readable paths, attachments aren't added to it.
+https://github.com/xieanqi1/patchcore-mvtec-repro/releases/tag/v1.0
 
-MCP
-Support for tools provided by MCP apps
-MCP apps are interactive interfaces provided by MCP servers. They can now register tools that the language model can call in its next request.
+包含两个压缩包：
 
-For example, the ShaderToy server lets the model iterate on shaders in real time.
+- weights_baseline.tar.gz：基线 15 类
+- weights_c2.tar.gz：本文方法 15 类
 
-Managed MCP allowlist precedence
-For MCP servers started by VS Code, the enterprise-managed allowedMcpServers list takes precedence over registry-only access, so your organization can approve servers without publishing them to its registry. See the Enterprise section on managed MCP allowlists for configuration details and restrictions.
+说明：PatchCore 不含可训练参数，所谓「权重」实为各类别正常样本的 coreset 记忆库，因此体积较大（每套约 1 GB）。
 
-Editor Experience
-Show specific files in excluded folders
-Settings:   files.exclude ,   search.exclude
+## 9. 已知问题与说明
 
-You can filter which files and folders are shown in the Explorer, Search, and Quick Open by using the   files.exclude and   search.exclude settings.
+1. 官方参数 anomaly_scorer_num_nn 在本实现中无可观测效果：把它由 1 改为 5 后，15 个类别的像素级 AUROC 完全不变。因此本文方法只采用 top-k 聚合这一单一组件。若需复现论文结果，请保持该参数为 1。
+2. 图像级分数的归一化：官方实现在计算指标前会对测试集分数做 min-max 归一化。该操作是单调变换，不改变 AUROC。
+3. 随机性：seed 固定为 0；不同硬件下 FAISS 检索的浮点误差可能导致末位数字差异。
 
-To keep part of an excluded folder visible, prefix a pattern with ! in   files.exclude . Matching files and folders show in the Explorer, Search, and Quick Open, even when another pattern or .gitignore excludes them. Exceptions in   search.exclude apply only to Search and Quick Open.
+## 10. 引用与许可
 
-"files.exclude": {
-    "node_modules": true,
-    "!node_modules/@types": true
+```bibtex
+@inproceedings{roth2022towards,
+  title     = {Towards Total Recall in Industrial Anomaly Detection},
+  author    = {Roth, Karsten and Pemula, Latha and Zepeda, Joaquin and Sch{\"o}lkopf, Bernhard and Brox, Thomas and Gehler, Peter},
+  booktitle = {CVPR},
+  year      = {2022}
 }
+```
 
-Exceptions never hide files. Patterns such as !**/node_modules/@types match at any depth but can make searches slower.
-
-Smart subgraph titles in Mermaid diagrams
-Edges in Mermaid diagrams no longer cover subgraph titles. A title moves to the side when an edge would cross it. With the default vscode Mermaid theme, subgraphs are outlined instead of filled, so nested subgraphs stand out.
-
-Screenshot showing a Mermaid diagram with nested subgraphs before and after the change: edges no longer cross the subgraph titles, and the subgraphs are outlined instead of filled.
-
-Enterprise
-Organization-required plugins can't be uninstalled
-When your organization requires an agent plugin, for example with the enabledPlugins managed setting, the Customizations views previously offered Uninstall for it. That action always failed and changed to Retry Uninstall, which also failed. The same happened for the prompts, skills, agents, hooks, and MCP servers that the plugin contributes.
-
-{
-    "enabledPlugins": {
-        "my-plugin@my-marketplace": true
-    }
-}
-
-The Uninstall action for these plugins and their contributions is now disabled and a message is shown on hover and keyboard focus. This applies to Browse, the plugin details, the plugin editor, and the plugin and MCP server menus.
-
-Screenshot showing an organization-required plugin in Browse customizations with a disabled Uninstall button and a hover saying the plugin is managed by your organization.
-
-Managed MCP allowlists take precedence over registry-only access
-Previously, when an organization limited MCP to servers from its registry and also defined an allowlist in managed settings, VS Code still required each server to be in the registry. Servers that the allowlist approved but that weren't published to the registry couldn't run.
-
-The enterprise-managed allowedMcpServers list is now authoritative. A server that matches the list can run even if it isn't in the registry, and a registry server that doesn't match is blocked. For example, the following enterprise-managed settings allow one remote server and one local server:
-
-{
-    "allowedMcpServers": [
-        { "serverUrl": "https://mcp.example.com/mcp" },
-        { "serverCommand": ["node", "approved-server.js"] }
-    ]
-}
-
-An empty list ([]) blocks all servers. If the list is absent, the registry restriction applies as before.
-User and workspace allowlists can't add servers to the enterprise list.
-deniedMcpServers and turning off MCP still take precedence over the allowlist.
-Prefer serverUrl and serverCommand rules. A serverName rule matches a label that the server's author chooses.
-Note: This change applies to MCP servers that VS Code starts, not to servers managed by the Agent Host.
-
-Contributions to extensions
-GitHub Pull Requests
-There has been more progress on the GitHub Pull Requests extension, which enables you to work on, create, and manage pull requests and issues. New features include:
-
-The pull request overview timeline shows more events, including label, milestone, and title changes, review requests and dismissals, draft and ready-for-review changes, force pushes, branch restores, auto-merge changes, and merge queue updates.
-Pull request description templates support issue variables such as ${issueTitle}, ${issueNumber}, and ${issueNumberLabel}, filled in from the issue associated with the branch by "Start Working on Issue".
-When you stack pull requests, you're prompted to disable auto-merge on any pull request in the stack that has it enabled.
-Review the changelog for the 0.176.0 release of the extension to learn about everything in the release.
-
-Extension Authoring
-Timeline API finalized
-Extensions published to the Marketplace can add their own history to the Timeline view, next to Git commits and Local History. Register providers with workspace.registerTimelineProvider for files and folders, or workspace.registerWorkspaceTimelineProvider for the whole workspace. Set TimelineItem.resourceUri to the resource's content as of that entry so users can compare it with other entries by using Compare Selected.
-
-Learn more about the Timeline API in the Timeline API documentation.
-
-Fun!
-Blobby jump game (Experimental)
-Take a short break with Blobby, the VS Code pet. Enter /vscode-pet in chat to show Blobby. On the new-session screen in the Agents window, choose Play Jump Game from Blobby's context menu. Hold the spacebar to charge a jump and use the arrow keys to aim for the next platform. The game remembers your high score on this device.
-
-
-Deprecated features and settings
-New deprecations in this release
-Install Extension tool removed from the Local harness
-The Install Extension (#installExtension) agent tool is no longer available in Local agent sessions. When you create a new workspace from chat, the agent no longer installs extensions. Instead, it adds the extensions the project needs to .vscode/extensions.json, so you can review and install them from the Extensions view. When you run a Python cell in a Jupyter notebook without the Jupyter extension, the kernel picker prompts you to install it.
-
-If your custom agents or prompt files reference #installExtension, remove that reference.
-
-Run VS Code Command tool removed from the Local harness
-The Run VS Code Command (#runCommand) agent tool is no longer available in Local agent sessions. Built-in workflows that relied on it now work without it. For example, when chat diagnoses network issues, it asks you to run Developer: Chat Diagnostics and share the report.
-
-If your custom agents or prompt files reference #runCommand, remove that reference.
-
-Workspace creation tool and slash command removed from the Local harness
-The Create New Workspace (#newWorkspace, previously #new) agent tool and the /new slash command are no longer available in Local agent sessions. The Generate New Workspace link on the Welcome page is also no longer available. The dedicated project-setup skills are removed.
-
-To create a project, open an empty folder and describe the project you want in an agent session. The agent uses its standard tools to create files, run scaffolding commands, and configure tasks.
-
-Remove references to #newWorkspace, #new, /new, project-setup-info-local, and project-setup-info-context7 from your custom agents and prompt files. The github.copilot.chat.newWorkspaceCreation.enabled, github.copilot.chat.newWorkspace.useContext7, and github.copilot.chat.useProjectTemplates settings are also removed. Notebook creation is unchanged.
-
-Upcoming deprecations
-None
-
-Notable fixes
-When an organization turned off the Claude or Codex agent, users who had picked that agent before got a read-only chat with no input from New Chat (+), New Chat Editor, and new windows. New chats now fall back to the default harness, and an unsent prompt carries over. Your previous choice applies again if the policy is lifted. #345207
-
-When an organization set MCP access to registry only in its GitHub Copilot policies, a failed policy refresh, for example from a network error or rate limiting, removed the restriction until the next successful refresh. VS Code now keeps the last known registry policy, and clears it only when GitHub reports that no registry applies. #344895
-
-Thank you
-Issue tracking
-Contributions to our issue tracking:
-
-@gjsjohnmurray (John Murray)
-@RedCMD (RedCMD)
-@IllusionMH (Andrii Dieiev)
-@albertosantini (Alberto Santini)
-Pull requests
-Contributions to vscode:
-
-@bompus (Aaron Queen): Refresh markdown preview html before a hidden panel is rebuilt PR #334681
-@cipheraxat (Akshat Anand): web: release code -w -g file:line once the file's editor closes PR #344740
-@denizguney (Deniz Güney Yıldırım): test: add mock reset configuration and test coverage support PR #338159
-@hardikkaurani (Hardik K): fix(arrays): throw TypeError for negative indices in quickSelect PR #342816
-@hirossan4049 (hirose): editorFind: fix swapped findMatch foreground colors (#228782) PR #270395
-@kinqsradio (Anh Dang)
-Fix requireLocalPort for range, regex, and host-and-port rules PR #344185
-Preserve inherited port protocol for exact-port attributes PR #344764
-@nathan-vincent-dev (nathan vincent): Fix typos "curent" and "filterd" PR #345134
-@Nikhil-4404 (Nikhil Kumar): Fix SSE stream-wide byte order mark handling PR #344094
-@pl4nty (Tom Plant): win32: fix installer's context menu COM surrogate kill command PR #344505
-@rfeltis (Ralph Feltis): Log telemetry when the closed-chat promo pip is armed PR #337997
-@RReverser (Ingvar Stepanyan): Fix copilot code reference output channel race PR #342272
-@SimonSiefke (Simon Siefke)
-fix: task system readiness races PR #342418
-fix: memory leak in terminal auto replies PR #336022
-@spencrr (Spencer Schoenberg): agentHost: add setting to turn off Copilot's Co-authored-by trailer PR #339437
-@VaggelisGian (Vaggelis Giannopoulos): Progress: store scoped while state with start time and delay swapped PR #332735
-@vscodebot-pr (VS Code PR Bot): fix: guard ListView dynamic-height probe against shrunk model (fixes #333550) PR #333563
-@wozhenbang2004 (Kayokoi): testing: respect keybindings before type-to-filter PR #344892
-@wycats (Yehuda Katz): Recognize userPromptTransformed plugin hooks in Copilot sessions PR #345068
-Contributions to vscode-pull-request-github:
-
-@kinqsradio (Anh Dang): Fix orphan stack worktree cleanup through macOS path aliases PR #9100
-@tamird (Tamir Duberstein): Batch Git config reads for branch operations PR #8978
-We really appreciate people trying our new features as soon as they are ready, so check back here often and learn what's new.
-
-If you'd like to read release notes for previous VS Code versions, go to Updates on code.visualstudio.com.
-
+本仓库基于 amazon-science/patchcore-inspection 修改，遵循上游 Apache-2.0 许可。使用 MVTec AD 数据集请遵守其官方许可（仅限非商业研究用途）。
