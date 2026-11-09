@@ -1,0 +1,18 @@
+diff --git a/src/patchcore/patchcore.py b/src/patchcore/patchcore.py
+index bcaa103..4601895 100644
+--- a/src/patchcore/patchcore.py
++++ b/src/patchcore/patchcore.py
+@@ -315,6 +315,13 @@ class PatchMaker:
+         if isinstance(x, np.ndarray):
+             was_numpy = True
+             x = torch.from_numpy(x)
++        import os
++        while x.ndim > 1 and x.shape[-1] == 1:
++            x = x.squeeze(-1)
++        _r = float(os.environ.get("PATCHCORE_TOPK_RATIO", "0") or 0)
++        if _r > 0 and x.ndim >= 1 and x.shape[-1] > 1:
++            _k = max(1, int(_r * x.shape[-1]))
++            x = torch.topk(x, _k, dim=-1).values.mean(dim=-1)
+         while x.ndim > 1:
+             x = torch.max(x, dim=-1).values
+         if was_numpy:
